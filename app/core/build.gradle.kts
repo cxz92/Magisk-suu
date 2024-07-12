@@ -40,9 +40,9 @@ dependencies {
     implementation("org.apache.commons:commons-compress:1.26.2")
 
     val vLibsu = "6.0.0"
-    api("com.github.topjohnwu.libsu:core:${vLibsu}")
-    api("com.github.topjohnwu.libsu:service:${vLibsu}")
-    api("com.github.topjohnwu.libsu:nio:${vLibsu}")
+    api("com.github.VivoMask.libsu:core:${vLibsu}")
+    api("com.github.VivoMask.libsu:service:${vLibsu}")
+    api("com.github.VivoMask.libsu:nio:${vLibsu}")
 
     val vRetrofit = "2.11.0"
     implementation("com.squareup.retrofit2:retrofit:${vRetrofit}")
