@@ -1,6 +1,8 @@
 import com.android.build.api.artifact.ArtifactTransformationRequest
 import com.android.build.api.artifact.SingleArtifact
 import com.android.build.api.dsl.ApkSigningConfig
+import com.android.build.api.instrumentation.FramesComputationMode.COMPUTE_FRAMES_FOR_INSTRUMENTED_METHODS
+import com.android.build.api.instrumentation.InstrumentationScope
 import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 import com.android.build.gradle.BaseExtension
 import com.android.build.gradle.LibraryExtension
@@ -15,8 +17,10 @@ import org.gradle.api.Action
 import org.gradle.api.DefaultTask
 import org.gradle.api.JavaVersion
 import org.gradle.api.Project
+import org.gradle.api.Task
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputFiles
@@ -39,8 +43,11 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.URI
 import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.cert.X509Certificate
+import java.util.HexFormat
 import java.util.jar.JarFile
 import java.util.zip.Deflater
 import java.util.zip.DeflaterOutputStream
@@ -65,18 +72,18 @@ private val Project.androidComponents
 
 fun Project.setupCommon() {
     androidBase {
-        compileSdkVersion(34)
+        compileSdkVersion(35)
         buildToolsVersion = "34.0.0"
         ndkPath = "$sdkDirectory/ndk/magisk"
-        ndkVersion = "27.0.11902837"
+        ndkVersion = "27.0.12077973"
 
         defaultConfig {
             minSdk = 23
         }
 
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_17
-            targetCompatibility = JavaVersion.VERSION_17
+            sourceCompatibility = JavaVersion.VERSION_21
+            targetCompatibility = JavaVersion.VERSION_21
         }
 
         packagingOptions {
@@ -104,29 +111,60 @@ fun Project.setupCommon() {
 
     tasks.withType<KotlinCompile> {
         compilerOptions {
-            jvmTarget = JvmTarget.JVM_17
+            jvmTarget = JvmTarget.JVM_21
         }
     }
 }
 
+const val BUSYBOX_DOWNLOAD_URL =
+    "https://github.com/topjohnwu/magisk-files/releases/download/files/busybox-1.36.1.1.zip"
+const val BUSYBOX_ZIP_CHECKSUM =
+    "b4d0551feabaf314e53c79316c980e8f66432e9fb91a69dbbf10a93564b40951"
+
 fun Project.setupCoreLib() {
     setupCommon()
 
+    val abiList = Config.abiList
+
     val syncLibs by tasks.registering(Sync::class) {
         into("src/main/jniLibs")
-        for (abi in arrayOf("armeabi-v7a", "x86", "arm64-v8a", "x86_64", "riscv64")) {
+        for (abi in abiList) {
             into(abi) {
                 from(rootProject.file("native/out/$abi")) {
-                    include("busybox", "magiskboot", "magiskinit", "magiskpolicy", "magisk")
-                    rename { "lib$it.so" }
+                    include("magiskboot", "magiskinit", "magiskpolicy", "magisk", "libinit-ld.so")
+                    rename { if (it.endsWith(".so")) it else "lib$it.so" }
                 }
             }
         }
         onlyIf {
-            if (inputs.sourceFiles.files.size != 25)
+            if (inputs.sourceFiles.files.size != abiList.size * 5)
                 throw StopExecutionException("Please build binaries first! (./build.py binary)")
             true
         }
+    }
+
+    val downloadBusybox by tasks.registering(Copy::class) {
+        dependsOn(syncLibs)
+        val bb = layout.buildDirectory.file(BUSYBOX_ZIP_CHECKSUM).get().asFile
+        if (bb.exists()) {
+            val md = MessageDigest.getInstance("SHA-256")
+            bb.inputStream().use { md.update(it.readAllBytes()) }
+            val hash = HexFormat.of().formatHex(md.digest())
+            if (hash != BUSYBOX_ZIP_CHECKSUM) {
+                bb.delete()
+            }
+        }
+        if (!bb.exists()) {
+            bb.parentFile.mkdirs()
+            URI(BUSYBOX_DOWNLOAD_URL).toURL().openStream().use { dl ->
+                bb.outputStream().use {
+                    dl.copyTo(it)
+                }
+            }
+        }
+        from(zipTree(bb))
+        include(abiList.map { "$it/libbusybox.so" })
+        into("src/main/jniLibs")
     }
 
     val syncResources by tasks.registering(Sync::class) {
@@ -142,7 +180,7 @@ fun Project.setupCoreLib() {
     androidLib.libraryVariants.all {
         val variantCapped = name.replaceFirstChar { it.uppercase() }
 
-        tasks.getByPath("merge${variantCapped}JniLibFolders").dependsOn(syncLibs)
+        tasks.getByPath("merge${variantCapped}JniLibFolders").dependsOn(downloadBusybox)
         processJavaResourcesProvider.configure { dependsOn(syncResources) }
 
         val stubTask = tasks.getByPath(":app:stub:comment$variantCapped")
@@ -261,7 +299,7 @@ fun Project.setupAppCommon() {
         }
 
         defaultConfig {
-            targetSdk = 34
+            targetSdk = 35
         }
 
         buildTypes {
@@ -313,7 +351,34 @@ fun Project.setupAppCommon() {
     }
 }
 
-fun Project.setupStub() {
+fun Project.setupMainApk() {
+    setupAppCommon()
+
+    android {
+        namespace = "com.topjohnwu.magisk"
+
+        defaultConfig {
+            applicationId = "com.topjohnwu.magisk"
+            vectorDrawables.useSupportLibrary = true
+            versionName = Config.version
+            versionCode = Config.versionCode
+            ndk {
+                abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64", "riscv64")
+                debugSymbolLevel = "FULL"
+            }
+        }
+
+        androidComponents.onVariants { variant ->
+            variant.instrumentation.apply {
+                setAsmFramesComputationMode(COMPUTE_FRAMES_FOR_INSTRUMENTED_METHODS)
+                transformClassesWith(
+                    DesugarClassVisitorFactory::class.java, InstrumentationScope.ALL) {}
+            }
+        }
+    }
+}
+
+fun Project.setupStubApk() {
     setupAppCommon()
 
     androidComponents.onVariants { variant ->
@@ -340,8 +405,8 @@ fun Project.setupStub() {
         val outAppClassDir = layout.buildDirectory.file("generated/source/app/${variantLowered}").get().asFile
         val outResDir = layout.buildDirectory.dir("generated/source/res/${variantLowered}").get().asFile
         val aapt = File(androidApp.sdkDirectory, "build-tools/${androidApp.buildToolsVersion}/aapt2")
-        val apk = layout.buildDirectory.file("intermediates/processed_res/" +
-            "${variantLowered}/process${variantCapped}Resources/out/resources-${variantLowered}.ap_").get().asFile
+        val apk = layout.buildDirectory.file("intermediates/linked_resources_binary_format/" +
+            "${variantLowered}/process${variantCapped}Resources/linked-resources-binary-format-${variantLowered}.ap_").get().asFile
 
         val genManifestTask = tasks.register("generate${variantCapped}ObfuscatedClass") {
             inputs.property("seed", RAND_SEED)
@@ -382,8 +447,8 @@ fun Project.setupStub() {
         registerJavaGeneratingTask(processResourcesTask, outResDir)
     }
     // Override optimizeReleaseResources task
-    val apk = layout.buildDirectory.file("intermediates/processed_res/" +
-        "release/processReleaseResources/out/resources-release.ap_").get().asFile
+    val apk = layout.buildDirectory.file("intermediates/linked_resources_binary_format/" +
+        "release/processReleaseResources/linked-resources-binary-format-release.ap_").get().asFile
     val optRes = layout.buildDirectory.file("intermediates/optimized_processed_res/" +
         "release/optimizeReleaseResources/resources-release-optimize.ap_").get().asFile
     afterEvaluate {
